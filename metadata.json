@@ -1,0 +1,5 @@
+{
+  "name": "Blog Article Image Generator",
+  "description": "An application that takes a blog article as input, intelligently generates descriptive image prompts, and then creates a series of stunning images for the article using AI.",
+  "requestFramePermissions": []
+}
