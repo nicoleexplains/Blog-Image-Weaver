@@ -51,7 +51,7 @@ const App: React.FC = () => {
       const imageUrl = await generateImageFromPrompt(imageToGenerate.prompt);
       setGeneratedImages(prevImages => {
         const newImages = [...prevImages];
-        newImages[index] = { ...newImages[index], imageUrl, status: 'success' };
+        newImages[index] = { ...newImages[index], imageUrl, status: 'success', error: undefined };
         return newImages;
       });
     } catch (imageGenError) {
@@ -60,11 +60,12 @@ const App: React.FC = () => {
 
       setGeneratedImages(prevImages => {
         const newImages = [...prevImages];
-        newImages[index] = { ...newImages[index], error: "Generation Failed", status: 'error' };
+        // Store the specific error message so the user knows if it was a safety filter issue
+        newImages[index] = { ...newImages[index], error: errorMessage, status: 'error' };
         return newImages;
       });
 
-      if (errorMessage.includes('API key') || errorMessage.includes('quota')) {
+      if (errorMessage.includes('API key') || errorMessage.includes('quota') || errorMessage.includes('429')) {
         setError(`A critical error occurred (quota limit or API key issue). Some images may have failed.`);
       }
     }
