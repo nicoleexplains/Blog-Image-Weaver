@@ -1,9 +1,32 @@
-
-import React, { useState, useCallback, useMemo } from 'react';
-import { generatePromptsFromArticle, generateImageFromPrompt } from './services/geminiService';
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
+import { generatePromptsFromArticle, generateImageFromPrompt, generateCaptionFromPrompt } from './services/geminiService';
 import type { GeneratedImage } from './types';
 import { ImageCard } from './components/ImageCard';
 import { Loader } from './components/Loader';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  Wand2, 
+  Plus, 
+  RotateCcw, 
+  LayoutGrid, 
+  AlertCircle, 
+  FileText, 
+  Image as ImageIcon,
+  Key,
+  ExternalLink
+} from 'lucide-react';
+
+const MAX_RETRIES = 3;
+
+// Extend Window interface for AI Studio specific APIs
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+  }
+}
 
 const App: React.FC = () => {
   const [articleText, setArticleText] = useState<string>('');
@@ -12,6 +35,26 @@ const App: React.FC = () => {
   const [isGeneratingMore, setIsGeneratingMore] = useState<boolean>(false);
   const [loadingMessage, setLoadingMessage] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const [hasApiKey, setHasApiKey] = useState<boolean>(true);
+
+  // Check for API key selection on mount
+  useEffect(() => {
+    const checkApiKey = async () => {
+      if (window.aistudio) {
+        const selected = await window.aistudio.hasSelectedApiKey();
+        setHasApiKey(selected);
+      }
+    };
+    checkApiKey();
+  }, []);
+
+  const handleSelectKey = async () => {
+    if (window.aistudio) {
+      await window.aistudio.openSelectKey();
+      // Assume success and proceed to app
+      setHasApiKey(true);
+    }
+  };
 
   const hasPendingImages = useMemo(() =>
     generatedImages.some(img => img.status === 'pending'),
@@ -37,54 +80,93 @@ const App: React.FC = () => {
     });
   }, []);
 
+  const handleFileNameChange = useCallback((index: number, newFileName: string) => {
+    setGeneratedImages(prevImages => {
+      const newImages = [...prevImages];
+      newImages[index].fileName = newFileName;
+      return newImages;
+    });
+  }, []);
+
+  const handleApiError = useCallback((err: unknown, context: string) => {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errStr = errorMessage.toLowerCase();
+    const isKeyError = errStr.includes('api key') || errStr.includes('expired') || errStr.includes('invalid') || errStr.includes('not found');
+    const isQuotaError = errStr.includes('quota') || errStr.includes('429') || errStr.includes('exhausted');
+
+    if (isKeyError) {
+      setError(`Your API key has expired or is invalid. Please select a new one.`);
+      setHasApiKey(false);
+    } else if (isQuotaError) {
+      setError(`A critical error occurred (quota limit). Please check your billing details.`);
+    } else {
+      setError(`${context}: ${errorMessage}`);
+    }
+    console.error(`${context}:`, err);
+  }, []);
+
   const handleGenerateSingleImage = useCallback(async (index: number) => {
     const imageToGenerate = generatedImages[index];
-    if (!imageToGenerate || (imageToGenerate.status !== 'pending' && imageToGenerate.status !== 'error')) return;
+    if (!imageToGenerate) return;
+
+    const canAttempt = 
+      imageToGenerate.status === 'pending' || 
+      imageToGenerate.status === 'success' || 
+      (imageToGenerate.status === 'error' && imageToGenerate.retryCount < MAX_RETRIES);
+    
+    if (!canAttempt) return;
 
     setGeneratedImages(prevImages => {
       const newImages = [...prevImages];
       newImages[index].status = 'loading';
+      newImages[index].error = undefined;
       return newImages;
     });
 
     try {
-      const imageUrl = await generateImageFromPrompt(imageToGenerate.prompt);
+      const [imageUrl, caption] = await Promise.all([
+        generateImageFromPrompt(imageToGenerate.prompt),
+        generateCaptionFromPrompt(imageToGenerate.prompt)
+      ]);
       setGeneratedImages(prevImages => {
         const newImages = [...prevImages];
-        newImages[index] = { ...newImages[index], imageUrl, status: 'success', error: undefined };
+        newImages[index] = { ...newImages[index], imageUrl, caption, status: 'success', error: undefined, retryCount: 0 };
         return newImages;
       });
     } catch (imageGenError) {
-      console.error(`Failed to generate image for prompt: "${imageToGenerate.prompt}"`, imageGenError);
-      const errorMessage = imageGenError instanceof Error ? imageGenError.message : 'An unknown error occurred.';
+      handleApiError(imageGenError, `Failed to generate image for index ${index}`);
 
       setGeneratedImages(prevImages => {
         const newImages = [...prevImages];
-        // Store the specific error message so the user knows if it was a safety filter issue
-        newImages[index] = { ...newImages[index], error: errorMessage, status: 'error' };
+        const currentImage = newImages[index];
+        const newRetryCount = currentImage.retryCount + 1;
+        
+        newImages[index] = { 
+          ...currentImage, 
+          error: imageGenError instanceof Error ? imageGenError.message : String(imageGenError), 
+          status: 'error',
+          retryCount: newRetryCount
+        };
         return newImages;
       });
-
-      if (errorMessage.includes('API key') || errorMessage.includes('quota') || errorMessage.includes('429')) {
-        setError(`A critical error occurred (quota limit or API key issue). Some images may have failed.`);
-      }
     }
   }, [generatedImages]);
 
   const handleGenerateAllImages = useCallback(async () => {
-    for (let i = 0; i < generatedImages.length; i++) {
-      // Use a function to get the latest status before deciding to generate
-      let shouldGenerate = false;
-      setGeneratedImages(prev => {
-        shouldGenerate = prev[i]?.status === 'pending';
-        return prev;
-      });
+    // Identify all indices that need generation
+    const indicesToGenerate = generatedImages.reduce((acc, img, idx) => {
+      const canAttempt = 
+        img.status === 'pending' || 
+        (img.status === 'error' && img.retryCount < MAX_RETRIES);
+      if (canAttempt) acc.push(idx);
+      return acc;
+    }, [] as number[]);
 
-      if (shouldGenerate) {
-        await handleGenerateSingleImage(i);
-      }
+    // Process them in sequence to avoid overwhelming the API and respect rate limits
+    for (const index of indicesToGenerate) {
+      await handleGenerateSingleImage(index);
     }
-  }, [generatedImages.length, handleGenerateSingleImage]);
+  }, [generatedImages, handleGenerateSingleImage]);
 
   const handleGeneratePrompts = useCallback(async () => {
     if (!articleText.trim()) {
@@ -99,12 +181,24 @@ const App: React.FC = () => {
 
     try {
       const prompts = await generatePromptsFromArticle(articleText);
-      const initialImages: GeneratedImage[] = prompts.map(prompt => ({ prompt, imageUrl: '', status: 'pending' }));
+      const initialImages: GeneratedImage[] = prompts.map(prompt => {
+        const defaultFileName = prompt
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, '')
+          .replace(/\s+/g, '-')
+          .slice(0, 50) || 'generated-image';
+        
+        return { 
+          prompt, 
+          imageUrl: '', 
+          fileName: defaultFileName,
+          status: 'pending',
+          retryCount: 0 
+        };
+      });
       setGeneratedImages(initialImages);
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-      setError(errorMessage);
-      console.error(err);
+      handleApiError(err, 'Failed to generate prompts');
     } finally {
       setIsLoading(false);
       setLoadingMessage('');
@@ -120,141 +214,267 @@ const App: React.FC = () => {
     try {
       const currentPrompts = generatedImages.map(img => img.prompt);
       const prompts = await generatePromptsFromArticle(articleText, currentPrompts);
-      const newImages: GeneratedImage[] = prompts.map(prompt => ({ prompt, imageUrl: '', status: 'pending' }));
+      const newImages: GeneratedImage[] = prompts.map(prompt => {
+        const defaultFileName = prompt
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, '')
+          .replace(/\s+/g, '-')
+          .slice(0, 50) || 'generated-image';
+
+        return { 
+          prompt, 
+          imageUrl: '', 
+          fileName: defaultFileName,
+          status: 'pending',
+          retryCount: 0
+        };
+      });
       setGeneratedImages(prev => [...prev, ...newImages]);
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'An unknown error occurred.';
-      setError(`Failed to generate more prompts: ${errorMessage}`);
-      console.error(err);
+      handleApiError(err, 'Failed to generate more prompts');
     } finally {
       setIsGeneratingMore(false);
     }
   }, [articleText, generatedImages]);
 
-  return (
-    <div className="min-h-screen bg-gray-900 text-white antialiased">
-      <div className="container mx-auto px-4 py-8 md:py-12">
-        
-        <header className="text-center mb-10">
-          <h1 className="text-4xl md:text-5xl font-extrabold tracking-tight text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-purple-500">
-            Blog Image Weaver
-          </h1>
-          <p className="mt-2 text-lg text-gray-400 max-w-2xl mx-auto">
-            Paste your article, generate prompts, then edit and weave them into a stunning visual gallery.
+  if (!hasApiKey) {
+    return (
+      <div className="min-h-screen bg-gray-950 flex items-center justify-center p-4">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="max-w-md w-full bg-gray-900 border border-gray-800 p-8 rounded-2xl shadow-2xl text-center"
+        >
+          <div className="w-16 h-16 bg-blue-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
+            <Key className="w-8 h-8 text-blue-400" />
+          </div>
+          <h2 className="text-2xl font-bold text-white mb-4">API Key Required</h2>
+          <p className="text-gray-400 mb-8">
+            To generate high-quality images with Gemini 3.1, you need to select a valid API key from a paid Google Cloud project.
           </p>
+          <button
+            onClick={handleSelectKey}
+            className="w-full py-3 px-6 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl transition-all flex items-center justify-center gap-2 group"
+          >
+            Select API Key
+            <ExternalLink className="w-4 h-4 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+          </button>
+          <a 
+            href="https://ai.google.dev/gemini-api/docs/billing" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            className="mt-6 inline-block text-sm text-gray-500 hover:text-gray-300 underline underline-offset-4"
+          >
+            Learn about Gemini API billing
+          </a>
+        </motion.div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#0a0a0a] text-gray-100 selection:bg-blue-500/30">
+      <div className="max-w-7xl mx-auto px-4 py-12 lg:py-20">
+        
+        <header className="mb-16 text-center lg:text-left lg:flex lg:items-end lg:justify-between gap-8">
+          <div className="max-w-2xl">
+            <motion.div 
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-blue-400 text-xs font-bold uppercase tracking-widest mb-4"
+            >
+              <Wand2 className="w-3 h-3" />
+              AI-Powered Visuals
+            </motion.div>
+            <motion.h1 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="text-5xl lg:text-7xl font-black tracking-tighter text-white mb-6 leading-[0.9]"
+            >
+              BLOG IMAGE <span className="text-blue-500">WEAVER</span>
+            </motion.h1>
+            <motion.p 
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.1 }}
+              className="text-lg text-gray-400 leading-relaxed"
+            >
+              Transform your written content into a curated gallery of cinematic visuals. 
+              Paste your article below to begin the weaving process.
+            </motion.p>
+          </div>
+          
+          <div className="hidden lg:block">
+            <div className="flex items-center gap-4 text-xs font-mono text-gray-500 uppercase tracking-widest">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+                System Ready
+              </div>
+              <div className="w-px h-4 bg-gray-800" />
+              <div>v3.1 Flash Image</div>
+            </div>
+          </div>
         </header>
 
-        <main>
-          <div className="max-w-4xl mx-auto">
-            <div className="bg-gray-800/50 p-6 rounded-xl shadow-2xl border border-gray-700 backdrop-blur-sm">
+        <main className="space-y-12">
+          <section className="relative">
+            <div className="absolute -inset-1 bg-gradient-to-r from-blue-500 to-purple-600 rounded-2xl blur opacity-20 group-hover:opacity-30 transition duration-1000 group-hover:duration-200" />
+            <div className="relative bg-gray-900 border border-gray-800 rounded-2xl overflow-hidden shadow-2xl">
+              <div className="flex items-center justify-between px-6 py-4 border-bottom border-gray-800 bg-gray-900/50">
+                <div className="flex items-center gap-2 text-sm font-semibold text-gray-300">
+                  <FileText className="w-4 h-4 text-blue-400" />
+                  Article Input
+                </div>
+                {articleText && (
+                  <div className="text-[10px] font-mono text-gray-500 uppercase">
+                    {articleText.length} characters
+                  </div>
+                )}
+              </div>
               <textarea
                 value={articleText}
                 onChange={(e) => setArticleText(e.target.value)}
-                placeholder="Paste your full blog article here..."
-                className="w-full h-48 p-4 bg-gray-900 border border-gray-600 rounded-lg resize-y focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors duration-200 text-gray-200 placeholder-gray-500"
+                placeholder="Paste your blog article here..."
+                className="w-full h-64 p-6 bg-transparent border-none focus:ring-0 text-gray-200 placeholder-gray-600 resize-none text-lg leading-relaxed"
                 disabled={isLoading || isGeneratingMore || (generatedImages.length > 0 && isGenerating)}
               />
-              <div className="mt-4 flex w-full items-center space-x-4">
+              <div className="p-6 bg-gray-900/80 border-t border-gray-800 flex flex-wrap gap-4 items-center">
                  {generatedImages.length === 0 ? (
                     <button
                       onClick={handleGeneratePrompts}
                       disabled={isLoading || !articleText.trim()}
-                      className="w-full flex items-center justify-center py-3 px-6 border border-transparent rounded-md shadow-sm text-base font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-blue-500 disabled:bg-gray-500 disabled:cursor-not-allowed transition-all duration-300"
+                      className="flex-1 lg:flex-none flex items-center justify-center gap-3 py-4 px-8 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-bold rounded-xl transition-all shadow-lg shadow-blue-900/20 active:scale-[0.98]"
                     >
                       {isLoading ? (
+                        <Loader message="Analyzing..." size="sm" />
+                      ) : (
                         <>
-                          <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                          </svg>
-                          Analyzing...
+                          <Wand2 className="w-5 h-5" />
+                          Analyze & Generate Prompts
                         </>
-                      ) : 'Generate Prompts'}
+                      )}
                     </button>
                  ) : (
                     <>
                       <button
                         onClick={handleGenerateAllImages}
                         disabled={isGenerating || !hasPendingImages || isGeneratingMore}
-                        className="flex-grow flex items-center justify-center py-3 px-6 border border-transparent rounded-md shadow-sm text-base font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-green-500 disabled:bg-gray-500 disabled:cursor-not-allowed transition-all duration-300"
+                        className="flex-1 lg:flex-none flex items-center justify-center gap-3 py-4 px-8 bg-green-600 hover:bg-green-500 disabled:bg-gray-800 disabled:text-gray-600 text-white font-bold rounded-xl transition-all shadow-lg shadow-green-900/20 active:scale-[0.98]"
                       >
                          {isGenerating ? (
+                           <Loader message="Weaving..." size="sm" />
+                         ) : (
                            <>
-                            <svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                            Working...
+                             <ImageIcon className="w-5 h-5" />
+                             Generate All Images
                            </>
-                         ) : 'Generate All'}
+                         )}
                       </button>
 
                       <button
                         onClick={handleGenerateMorePrompts}
                         disabled={isGenerating || isGeneratingMore}
-                        className="flex-grow-0 whitespace-nowrap flex items-center justify-center py-3 px-6 border border-transparent rounded-md shadow-sm text-base font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-blue-500 disabled:bg-gray-500 disabled:cursor-not-allowed transition-all duration-300"
+                        className="flex items-center justify-center gap-2 py-4 px-6 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-white font-bold rounded-xl transition-all active:scale-[0.98]"
                       >
                         {isGeneratingMore ? (
+                          <Loader message="" size="sm" />
+                        ) : (
                           <>
-                             <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                            + 5 More
+                            <Plus className="w-5 h-5" />
+                            5 More Prompts
                           </>
-                        ) : '+ 5 More'}
+                        )}
                       </button>
+
+                      <div className="flex-1" />
 
                       <button
                         onClick={handleReset}
                         disabled={isGenerating || isGeneratingMore}
-                        aria-label="Start over with a new article"
-                        className="shrink-0 flex items-center justify-center py-3 px-6 border border-gray-600 rounded-md shadow-sm text-base font-medium text-gray-200 bg-gray-700 hover:bg-gray-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-gray-900 focus:ring-gray-500 transition-colors disabled:opacity-50"
+                        className="flex items-center justify-center gap-2 py-4 px-6 text-gray-400 hover:text-white hover:bg-gray-800 rounded-xl transition-all"
                       >
-                        Start Over
+                        <RotateCcw className="w-5 h-5" />
+                        Reset
                       </button>
                     </>
                  )}
               </div>
             </div>
-          </div>
+          </section>
           
-          <div className="mt-12">
+          <AnimatePresence mode="wait">
             {error && (
-              <div className="max-w-4xl mx-auto bg-red-900/50 text-red-200 border border-red-700 p-4 rounded-lg text-center mb-8">
-                <p><strong>Error:</strong> {error}</p>
-              </div>
+              <motion.div 
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: 'auto' }}
+                exit={{ opacity: 0, height: 0 }}
+                className="bg-red-500/10 border border-red-500/20 p-4 rounded-xl flex items-start gap-3"
+              >
+                <AlertCircle className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                <div>
+                  <h3 className="text-sm font-bold text-red-400 uppercase tracking-wider mb-1">System Error</h3>
+                  <p className="text-red-200/80 text-sm leading-relaxed">{error}</p>
+                </div>
+              </motion.div>
             )}
-            
-            {isLoading && (
-              <div className="flex justify-center mt-8">
-                <Loader message={loadingMessage} />
+          </AnimatePresence>
+
+          <section>
+            {generatedImages.length > 0 && (
+              <div className="flex items-center justify-between mb-8">
+                <div className="flex items-center gap-3">
+                  <LayoutGrid className="w-5 h-5 text-blue-500" />
+                  <h2 className="text-2xl font-bold text-white tracking-tight">Image Gallery</h2>
+                </div>
+                <div className="text-xs font-mono text-gray-500 uppercase tracking-widest">
+                  {generatedImages.filter(img => img.status === 'success').length} / {generatedImages.length} Completed
+                </div>
               </div>
             )}
 
             {generatedImages.length === 0 && !isLoading && !error && (
-               <div className="text-center text-gray-500 mt-16">
-                 <svg xmlns="http://www.w3.org/2000/svg" className="mx-auto h-12 w-12 text-gray-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                 </svg>
-                 <p className="mt-4 text-lg">Your generated images will appear here.</p>
-               </div>
+               <motion.div 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="py-32 text-center border-2 border-dashed border-gray-800 rounded-3xl"
+               >
+                 <div className="w-20 h-20 bg-gray-900 rounded-full flex items-center justify-center mx-auto mb-6">
+                   <ImageIcon className="w-10 h-10 text-gray-700" />
+                 </div>
+                 <h3 className="text-xl font-bold text-gray-400 mb-2">No visuals generated yet</h3>
+                 <p className="text-gray-600 max-w-xs mx-auto">
+                   Paste an article and generate prompts to see your gallery come to life.
+                 </p>
+               </motion.div>
             )}
 
-            {generatedImages.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 xl:gap-8 mt-8">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 xl:gap-8">
+              <AnimatePresence>
                 {generatedImages.map((image, index) => (
-                  <ImageCard
+                  <motion.div
                     key={index}
-                    image={image}
-                    onPromptChange={(newPrompt) => handlePromptChange(index, newPrompt)}
-                    onGenerate={() => handleGenerateSingleImage(index)}
-                  />
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    transition={{ delay: index * 0.05 }}
+                  >
+                    <ImageCard
+                      image={image}
+                      onPromptChange={(newPrompt) => handlePromptChange(index, newPrompt)}
+                      onFileNameChange={(newFileName) => handleFileNameChange(index, newFileName)}
+                      onGenerate={() => handleGenerateSingleImage(index)}
+                    />
+                  </motion.div>
                 ))}
-              </div>
-            )}
-          </div>
+              </AnimatePresence>
+            </div>
+          </section>
         </main>
+
+        <footer className="mt-32 pt-12 border-t border-gray-900 text-center">
+          <p className="text-gray-600 text-sm font-medium tracking-widest uppercase">
+            Powered by Gemini 3.1 Flash Image
+          </p>
+        </footer>
 
       </div>
     </div>
